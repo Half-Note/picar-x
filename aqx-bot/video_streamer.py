@@ -5,6 +5,11 @@ from flask import Flask, Response
 app = Flask(__name__)
 
 picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(main={"size": (640, 480)}))
+
+# Set auto white balance to a warmer mode (like 'sunlight')
+picam2.set_controls({"AwbMode": 2})  # 0=off, 1=auto, 2=sunlight, 3=cloudy, 4=shade, 5=tungsten, 6=fluorescent
+
 picam2.start()
 
 def generate_frames():
@@ -27,4 +32,3 @@ def video_feed():
 if __name__ == '__main__':
     print("Open http://<your_pi_ip>:5000/video_feed")
     app.run(host='0.0.0.0', port=5000)
-
