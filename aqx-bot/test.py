@@ -46,22 +46,30 @@ def speak(text):
 def sound_system_listener():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', SOUND_PORT))
-    sock.settimeout(0.1)  # Shorter timeout for better responsiveness
+    sock.settimeout(0.1)  # Short timeout for responsiveness
     print(f"\U0001F50E Sound system listening on UDP port {SOUND_PORT}...")
 
     while not stop_flag.is_set():
         try:
-            data, _ = sock.recvfrom(1024)
+            data, addr = sock.recvfrom(1024)
             msg = data.decode().strip()
+            print(f"Received sound message: {msg}")  # Debug print
+            
             if msg.startswith("SAY:"):
                 speak(msg.split(":", 1)[1])
             elif msg == "HORN":
                 play_horn()
+            elif msg:  # Any non-empty message
+                print(f"Unknown sound command: {msg}")
+                
         except socket.timeout:
             continue
         except Exception as e:
             print(f"Sound system error: {e}")
+            sleep(0.1)
+    
     sock.close()
+    print("Sound listener stopped")
 
 # Obstacle detection with horn
 def obstacle_detection():
@@ -78,17 +86,6 @@ def obstacle_detection():
             print(f"Obstacle detection error: {e}")
             sleep(1)
 
-# Dummy data helpers
-def get_dummy_uwb():
-    return {'x': 1.23, 'y': 4.56, 'z': 0.78}
-
-def get_dummy_imu():
-    return {
-        "gyro": [0.0, 0.0, 0.0],
-        "accel": [0.0, 0.0, 9.8],
-        "mag": [0.1, 0.1, 0.1]
-    }
-
 # Sensor UDP streaming
 def sensor_stream():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -97,8 +94,7 @@ def sensor_stream():
             dist = px.ultrasonic.read() if hasattr(px, "ultrasonic") else -1.0
             data = {
                 "ultrasonic_distance": dist,
-                "uwb_location": get_dummy_uwb(),
-                "imu": get_dummy_imu()
+                "timestamp": time.time()
             }
             msg = json.dumps(data).encode('utf-8')
             sock.sendto(msg, (ROS2_UDP_IP, ROS2_UDP_PORT))
@@ -108,27 +104,26 @@ def sensor_stream():
             sleep(1)
     sock.close()
 
-# Improved non-blocking motion control listener
+# Improved motion control listener
 def control_listener():
     global last_dir_angle, last_camera_yaw, last_camera_pitch
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', CONTROL_PORT))
     sock.settimeout(CONTROL_TIMEOUT)
-    print(f"Listening for motion/camera commands on UDP port {CONTROL_PORT}...")
+    print(f"Listening for motion commands on UDP port {CONTROL_PORT}...")
 
     while not stop_flag.is_set():
         try:
             data, _ = sock.recvfrom(1024)
             if len(data) not in [8, 12, 16]:
-                print(f"Unexpected packet size: {len(data)}")
                 continue
 
             linear, angular, *camera = struct.unpack('f' * (len(data) // 4), data)
             yaw, pitch = (camera + [None, None])[:2]
             
-            # Only print if we have meaningful values
-            if abs(linear) > 0.01 or abs(angular) > 0.01 or (yaw is not None and abs(yaw) > 0.1) or (pitch is not None and abs(pitch) > 0.1):
-                print(f"Cmd: linear={linear:.2f}, angular={angular:.2f}, yaw={yaw}, pitch={pitch}")
+            # Only process if values are significant
+            if abs(linear) > 0.01 or abs(angular) > 0.01:
+                print(f"Motion cmd: linear={linear:.2f}, angular={angular:.2f}")
 
             # Steering
             new_dir = max(min(angular * 10, 35), -35)
@@ -136,13 +131,13 @@ def control_listener():
                 px.set_dir_servo_angle(new_dir)
                 last_dir_angle = new_dir
 
-            # Driving - only act if above threshold
+            # Driving
             if abs(linear) < 0.05:
                 px.stop()
             else:
                 px.forward(20) if linear > 0 else px.backward(20)
 
-            # Camera pan/tilt
+            # Camera control (if provided)
             if yaw is not None:
                 yaw = max(min(yaw, 35), -35)
                 if last_camera_yaw is None or abs(yaw - last_camera_yaw) > 0.1:
@@ -158,10 +153,12 @@ def control_listener():
         except socket.timeout:
             continue
         except Exception as e:
-            print(f"Control listener error: {e}")
-            sleep(1)
+            print(f"Control error: {e}")
+            sleep(0.1)
+    
     sock.close()
-    px.stop()  # Ensure robot stops when control listener exits
+    px.stop()
+    print("Control listener stopped")
 
 # Safe shutdown
 def stop_all():
@@ -182,7 +179,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 # Main
 def main():
-    # Start all threads
+    # Start all components
     threads = [
         threading.Thread(target=sensor_stream, daemon=True),
         threading.Thread(target=sound_system_listener, daemon=True),
@@ -198,6 +195,9 @@ def main():
         while True:
             sleep(1)
     except KeyboardInterrupt:
+        stop_all()
+    except Exception as e:
+        print(f"Main error: {e}")
         stop_all()
 
 if __name__ == '__main__':
