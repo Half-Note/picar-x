@@ -20,7 +20,6 @@ ROS2_UDP_IP = "192.168.1.102"  # Replace with your ROS 2 PC's IP
 ROS2_UDP_PORT = 5005
 CONTROL_PORT = 9001
 SOUND_PORT = 9100
-CONTROL_TIMEOUT = 0.1  # Reduced timeout for more responsive control
 
 # Initialize modules
 px = Picarx()
@@ -34,7 +33,24 @@ last_camera_yaw = None
 last_camera_pitch = None
 stop_flag = threading.Event()
 
-# Sound system functions
+# Safe shutdown
+def stop_all():
+    print("Stopping robot and resetting angles...")
+    stop_flag.set()
+    px.stop()
+    px.set_dir_servo_angle(0)
+    px.set_cam_pan_angle(0)
+    px.set_cam_tilt_angle(0)
+
+def signal_handler(sig, frame):
+    stop_all()
+    print("\nTerminated by signal.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# Sound System Functions
 def play_horn():
     print("\U0001F514 Honking...")
     music.sound_play_threading('../sounds/car-double-horn.wav')
@@ -43,50 +59,32 @@ def speak(text):
     print(f"\U0001F5E3 TTS: {text}")
     tts.say(text)
 
-def sound_system_listener():
+def sound_listener():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', SOUND_PORT))
     sock.settimeout(0.1)  # Short timeout for responsiveness
+    
     print(f"\U0001F50E Sound system listening on UDP port {SOUND_PORT}...")
-
     while not stop_flag.is_set():
         try:
             data, addr = sock.recvfrom(1024)
             msg = data.decode().strip()
-            print(f"Received sound message: {msg}")  # Debug print
+            print(f"Received sound command: {msg}")  # Debug output
             
             if msg.startswith("SAY:"):
-                speak(msg.split(":", 1)[1])
+                speak(msg[4:])  # Extract text after "SAY:"
             elif msg == "HORN":
                 play_horn()
-            elif msg:  # Any non-empty message
-                print(f"Unknown sound command: {msg}")
                 
         except socket.timeout:
             continue
         except Exception as e:
-            print(f"Sound system error: {e}")
-            sleep(0.1)
+            print(f"Sound listener error: {e}")
     
     sock.close()
     print("Sound listener stopped")
 
-# Obstacle detection with horn
-def obstacle_detection():
-    while not stop_flag.is_set():
-        try:
-            distance = round(px.ultrasonic.read(), 2)
-            print("?? Distance:", distance, "cm")
-
-            if distance < DANGER_DISTANCE:
-                play_horn()
-                sleep(1)  # Prevent continuous honking
-            sleep(0.1)
-        except Exception as e:
-            print(f"Obstacle detection error: {e}")
-            sleep(1)
-
-# Sensor UDP streaming
+# Sensor Data Streaming
 def sensor_stream():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while not stop_flag.is_set():
@@ -104,14 +102,14 @@ def sensor_stream():
             sleep(1)
     sock.close()
 
-# Improved motion control listener
+# Motion Control Listener
 def control_listener():
     global last_dir_angle, last_camera_yaw, last_camera_pitch
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', CONTROL_PORT))
-    sock.settimeout(CONTROL_TIMEOUT)
+    sock.settimeout(0.1)  # Reduced timeout
+    
     print(f"Listening for motion commands on UDP port {CONTROL_PORT}...")
-
     while not stop_flag.is_set():
         try:
             data, _ = sock.recvfrom(1024)
@@ -121,7 +119,7 @@ def control_listener():
             linear, angular, *camera = struct.unpack('f' * (len(data) // 4), data)
             yaw, pitch = (camera + [None, None])[:2]
             
-            # Only process if values are significant
+            # Only print if we have meaningful values
             if abs(linear) > 0.01 or abs(angular) > 0.01:
                 print(f"Motion cmd: linear={linear:.2f}, angular={angular:.2f}")
 
@@ -137,7 +135,7 @@ def control_listener():
             else:
                 px.forward(20) if linear > 0 else px.backward(20)
 
-            # Camera control (if provided)
+            # Camera control
             if yaw is not None:
                 yaw = max(min(yaw, 35), -35)
                 if last_camera_yaw is None or abs(yaw - last_camera_yaw) > 0.1:
@@ -154,36 +152,17 @@ def control_listener():
             continue
         except Exception as e:
             print(f"Control error: {e}")
-            sleep(0.1)
     
     sock.close()
     px.stop()
     print("Control listener stopped")
 
-# Safe shutdown
-def stop_all():
-    print("\nStopping all systems...")
-    stop_flag.set()
-    px.stop()
-    px.set_dir_servo_angle(0)
-    px.set_cam_pan_angle(0)
-    px.set_cam_tilt_angle(0)
-
-def signal_handler(sig, frame):
-    stop_all()
-    print("Terminated by signal.")
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# Main
+# Main Function
 def main():
-    # Start all components
+    # Start all threads
     threads = [
         threading.Thread(target=sensor_stream, daemon=True),
-        threading.Thread(target=sound_system_listener, daemon=True),
-        threading.Thread(target=obstacle_detection, daemon=True),
+        threading.Thread(target=sound_listener, daemon=True),
         threading.Thread(target=control_listener, daemon=True)
     ]
 
@@ -192,7 +171,7 @@ def main():
 
     # Keep main thread alive
     try:
-        while True:
+        while not stop_flag.is_set():
             sleep(1)
     except KeyboardInterrupt:
         stop_all()
