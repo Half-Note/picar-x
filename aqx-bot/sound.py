@@ -44,7 +44,7 @@ def socket_listener():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', UDP_PORT))
     sock.settimeout(0.5)
-    print(f"?? Listening on UDP port {UDP_PORT} for TTS...")
+    print(f"?? Listening on UDP port {UDP_PORT} for TTS and horn...")
 
     while True:
         try:
@@ -53,6 +53,8 @@ def socket_listener():
             if msg.startswith("SAY:"):
                 sentence = msg.split(":", 1)[1]
                 speak(sentence)
+            elif msg == "HORN":
+                play_horn()
         except socket.timeout:
             continue
         except Exception as e:
