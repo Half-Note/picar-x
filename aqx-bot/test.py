@@ -20,6 +20,7 @@ ROS2_UDP_IP = "192.168.1.102"  # Replace with your ROS 2 PC's IP
 ROS2_UDP_PORT = 5005
 CONTROL_PORT = 9001
 SOUND_PORT = 9100
+CONTROL_TIMEOUT = 0.1  # Reduced timeout for more responsive control
 
 # Initialize modules
 px = Picarx()
@@ -31,26 +32,9 @@ tts.lang("en-US")
 last_dir_angle = 0.0
 last_camera_yaw = None
 last_camera_pitch = None
+stop_flag = threading.Event()
 
-# Safe shutdown
-
-def stop_all():
-    print("Stopping robot and resetting angles...")
-    px.stop()
-    px.set_dir_servo_angle(0)
-    px.set_cam_pan_angle(0)
-    px.set_cam_tilt_angle(0)
-
-def signal_handler(sig, frame):
-    stop_all()
-    print("\nTerminated by signal.")
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# Horn and TTS
-
+# Sound system functions
 def play_horn():
     print("\U0001F514 Honking...")
     music.sound_play_threading('../sounds/car-double-horn.wav')
@@ -59,13 +43,13 @@ def speak(text):
     print(f"\U0001F5E3 TTS: {text}")
     tts.say(text)
 
-def socket_listener():
+def sound_system_listener():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', SOUND_PORT))
-    sock.settimeout(0.5)
-    print(f"\U0001F50E Listening on UDP port {SOUND_PORT} for TTS and horn...")
+    sock.settimeout(0.1)  # Shorter timeout for better responsiveness
+    print(f"\U0001F50E Sound system listening on UDP port {SOUND_PORT}...")
 
-    while True:
+    while not stop_flag.is_set():
         try:
             data, _ = sock.recvfrom(1024)
             msg = data.decode().strip()
@@ -76,10 +60,25 @@ def socket_listener():
         except socket.timeout:
             continue
         except Exception as e:
-            print(f"Socket error: {e}")
+            print(f"Sound system error: {e}")
+    sock.close()
+
+# Obstacle detection with horn
+def obstacle_detection():
+    while not stop_flag.is_set():
+        try:
+            distance = round(px.ultrasonic.read(), 2)
+            print("?? Distance:", distance, "cm")
+
+            if distance < DANGER_DISTANCE:
+                play_horn()
+                sleep(1)  # Prevent continuous honking
+            sleep(0.1)
+        except Exception as e:
+            print(f"Obstacle detection error: {e}")
+            sleep(1)
 
 # Dummy data helpers
-
 def get_dummy_uwb():
     return {'x': 1.23, 'y': 4.56, 'z': 0.78}
 
@@ -91,30 +90,33 @@ def get_dummy_imu():
     }
 
 # Sensor UDP streaming
-
 def sensor_stream():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    while True:
-        dist = px.ultrasonic.read() if hasattr(px, "ultrasonic") else -1.0
-        data = {
-            "ultrasonic_distance": dist,
-            "uwb_location": get_dummy_uwb(),
-            "imu": get_dummy_imu()
-        }
-        msg = json.dumps(data).encode('utf-8')
-        sock.sendto(msg, (ROS2_UDP_IP, ROS2_UDP_PORT))
-        sleep(0.1)
+    while not stop_flag.is_set():
+        try:
+            dist = px.ultrasonic.read() if hasattr(px, "ultrasonic") else -1.0
+            data = {
+                "ultrasonic_distance": dist,
+                "uwb_location": get_dummy_uwb(),
+                "imu": get_dummy_imu()
+            }
+            msg = json.dumps(data).encode('utf-8')
+            sock.sendto(msg, (ROS2_UDP_IP, ROS2_UDP_PORT))
+            sleep(0.1)
+        except Exception as e:
+            print(f"Sensor stream error: {e}")
+            sleep(1)
+    sock.close()
 
-# Motion + camera control
-
+# Improved non-blocking motion control listener
 def control_listener():
     global last_dir_angle, last_camera_yaw, last_camera_pitch
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', CONTROL_PORT))
-    sock.settimeout(1.0)
+    sock.settimeout(CONTROL_TIMEOUT)
     print(f"Listening for motion/camera commands on UDP port {CONTROL_PORT}...")
 
-    while True:
+    while not stop_flag.is_set():
         try:
             data, _ = sock.recvfrom(1024)
             if len(data) not in [8, 12, 16]:
@@ -123,7 +125,10 @@ def control_listener():
 
             linear, angular, *camera = struct.unpack('f' * (len(data) // 4), data)
             yaw, pitch = (camera + [None, None])[:2]
-            print(f"Cmd: linear={linear:.2f}, angular={angular:.2f}, yaw={yaw}, pitch={pitch}")
+            
+            # Only print if we have meaningful values
+            if abs(linear) > 0.01 or abs(angular) > 0.01 or (yaw is not None and abs(yaw) > 0.1) or (pitch is not None and abs(pitch) > 0.1):
+                print(f"Cmd: linear={linear:.2f}, angular={angular:.2f}, yaw={yaw}, pitch={pitch}")
 
             # Steering
             new_dir = max(min(angular * 10, 35), -35)
@@ -131,7 +136,7 @@ def control_listener():
                 px.set_dir_servo_angle(new_dir)
                 last_dir_angle = new_dir
 
-            # Driving
+            # Driving - only act if above threshold
             if abs(linear) < 0.05:
                 px.stop()
             else:
@@ -151,15 +156,49 @@ def control_listener():
                     last_camera_pitch = pitch
 
         except socket.timeout:
-            px.stop()
             continue
+        except Exception as e:
+            print(f"Control listener error: {e}")
+            sleep(1)
+    sock.close()
+    px.stop()  # Ensure robot stops when control listener exits
+
+# Safe shutdown
+def stop_all():
+    print("\nStopping all systems...")
+    stop_flag.set()
+    px.stop()
+    px.set_dir_servo_angle(0)
+    px.set_cam_pan_angle(0)
+    px.set_cam_tilt_angle(0)
+
+def signal_handler(sig, frame):
+    stop_all()
+    print("Terminated by signal.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # Main
-
 def main():
-    threading.Thread(target=sensor_stream, daemon=True).start()
-    threading.Thread(target=socket_listener, daemon=True).start()
-    control_listener()  # blocking
+    # Start all threads
+    threads = [
+        threading.Thread(target=sensor_stream, daemon=True),
+        threading.Thread(target=sound_system_listener, daemon=True),
+        threading.Thread(target=obstacle_detection, daemon=True),
+        threading.Thread(target=control_listener, daemon=True)
+    ]
+
+    for t in threads:
+        t.start()
+
+    # Keep main thread alive
+    try:
+        while True:
+            sleep(1)
+    except KeyboardInterrupt:
+        stop_all()
 
 if __name__ == '__main__':
     main()
